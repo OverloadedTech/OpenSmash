@@ -1,0 +1,11 @@
+# game data (never committed)
+*.apk
+/extracted/
+/game-assets/
+# build outputs and packages (root only: vendored sources contain build_config/, build-scripts/, dist/ dirs)
+/build*/
+/out/
+/dist/
+/.venv/
+*.so
+__pycache__/

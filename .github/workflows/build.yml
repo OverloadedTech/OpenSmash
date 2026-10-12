@@ -1,0 +1,92 @@
+name: build
+# Every push / pull request: build and unit-test all four platforms and upload asset-free packages
+# (players add their own APK). Game assets never end up in CI artifacts; they are only bundled by release.yml.
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {platform: linux-x64,   os: ubuntu-24.04,     preset: linux-gcc,    binary: build/linux-gcc/opensmash}
+          - {platform: linux-arm64, os: ubuntu-24.04-arm, preset: linux-gcc,    binary: build/linux-gcc/opensmash}
+          - {platform: macos-arm64, os: macos-15,         preset: macos-arm64,  binary: build/macos-arm64/OpenSmash.app}
+          - {platform: windows-x64, os: windows-2022,     preset: windows-msvc, binary: build/windows-msvc/RelWithDebInfo/opensmash.exe}
+    name: ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Linux build dependencies (for the bundled SDL3)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxfixes-dev libxss-dev libxtst-dev libxrender-dev libwayland-dev wayland-protocols libxkbcommon-dev \
+            libdecor-0-dev libasound2-dev libpulse-dev libgl-dev libegl-dev libdrm-dev libgbm-dev libudev-dev libdbus-1-dev
+      - name: macOS build dependencies
+        if: runner.os == 'macOS'
+        run: brew list ninja >/dev/null 2>&1 || brew install ninja
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }} -DOPENSMASH_VERSION_STRING="ci-${GITHUB_SHA::7}"
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} --parallel
+      - name: Unit tests (asset-backed tests skip without game data)
+        run: ctest --test-dir build/${{ matrix.preset }} -C RelWithDebInfo --output-on-failure
+      - name: Package (no game assets)
+        run: python tools/make_release.py --platform ${{ matrix.platform }} --binary "${{ matrix.binary }}" --version "ci-${GITHUB_SHA::7}" --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: opensmash-${{ matrix.platform }}
+          path: dist/*
+          retention-days: 14
+          if-no-files-found: error
+
+  # The full suite with real game data (every asset parsed, all 151 level scripts, the original menu/HUD, a bot playing
+  # every campaign room). Needs the ASSETS_APK_URL secret; secrets are not available to pull requests from forks, so
+  # it only runs for pushes and manual runs.
+  game-data-tests:
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Get game assets
+        id: assets
+        env:
+          ASSETS_APK_URL: ${{ secrets.ASSETS_APK_URL }}
+          ASSETS_APK_TOKEN: ${{ secrets.ASSETS_APK_TOKEN }}
+          ASSETS_APK_SHA256: ${{ secrets.ASSETS_APK_SHA256 }}
+        run: python tools/ci_fetch_assets.py "$RUNNER_TEMP/game-assets"
+      - name: Install Ninja (SH_BUILD_GAME=OFF needs no SDL3 dependencies)
+        if: steps.assets.outputs.have == 'true'
+        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Build
+        if: steps.assets.outputs.have == 'true'
+        run: |
+          cmake --preset linux-gcc -DSH_BUILD_GAME=OFF
+          cmake --build --preset linux-gcc --parallel
+      - name: All tests with game data
+        if: steps.assets.outputs.have == 'true'
+        env:
+          SH_ASSETS: ${{ steps.assets.outputs.dir }}
+        run: ctest --test-dir build/linux-gcc --output-on-failure

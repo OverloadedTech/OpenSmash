@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- Process code page UTF-8 (Windows 10 1903+): SDL returns UTF-8 paths (user profile, file dialog, base path) and the
+     game passes them to the narrow C/C++ file APIs, so saves and assets under non-ASCII paths (C:\Users\José) work. -->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>

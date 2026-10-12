@@ -1,0 +1,111 @@
+name: release
+# Push a tag "vX.Y.Z" (or "vX.Y.Z-rc1" for a pre-release) to build all platforms with the game assets bundled and
+# publish them as a GitHub Release. "Run workflow" (manual) performs a dry run: same packages, uploaded as workflow
+# artifacts only, nothing is published. See docs/RELEASING.md.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version label for the dry-run packages (nothing is published)'
+        required: true
+        default: '0.0.0-dryrun'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - {platform: linux-x64,   os: ubuntu-24.04,     preset: linux-gcc,    binary: build/linux-gcc/opensmash}
+          - {platform: linux-arm64, os: ubuntu-24.04-arm, preset: linux-gcc,    binary: build/linux-gcc/opensmash}
+          - {platform: macos-arm64, os: macos-15,         preset: macos-arm64,  binary: build/macos-arm64/OpenSmash.app}
+          - {platform: windows-x64, os: windows-2022,     preset: windows-msvc, binary: build/windows-msvc/RelWithDebInfo/opensmash.exe}
+    name: package ${{ matrix.platform }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          # only a tag push is a release; a manual run (even on a tag) is a dry run labelled with the input version
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ]; then v="${GITHUB_REF_NAME#v}"; else v="$INPUT_VERSION"; fi
+          if ! [[ "$v" =~ ^[0-9A-Za-z][0-9A-Za-z.+-]*$ ]]; then echo "::error::invalid version '$v'"; exit 1; fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+      - name: Get game assets
+        id: assets
+        env:
+          ASSETS_APK_URL: ${{ secrets.ASSETS_APK_URL }}
+          ASSETS_APK_TOKEN: ${{ secrets.ASSETS_APK_TOKEN }}
+          ASSETS_APK_SHA256: ${{ secrets.ASSETS_APK_SHA256 }}
+        run: python tools/ci_fetch_assets.py "$RUNNER_TEMP/game-assets" --require
+      - name: Linux build dependencies (for the bundled SDL3)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev \
+            libxfixes-dev libxss-dev libxtst-dev libxrender-dev libwayland-dev wayland-protocols libxkbcommon-dev \
+            libdecor-0-dev libasound2-dev libpulse-dev libgl-dev libegl-dev libdrm-dev libgbm-dev libudev-dev libdbus-1-dev
+      - name: macOS build dependencies
+        if: runner.os == 'macOS'
+        run: brew list ninja >/dev/null 2>&1 || brew install ninja
+      - name: Configure
+        run: cmake --preset ${{ matrix.preset }} -DOPENSMASH_VERSION_STRING="${{ steps.version.outputs.version }}"
+      - name: Build
+        run: cmake --build --preset ${{ matrix.preset }} --parallel
+      - name: Tests with game data
+        env:
+          SH_ASSETS: ${{ steps.assets.outputs.dir }}
+        run: ctest --test-dir build/${{ matrix.preset }} -C RelWithDebInfo --output-on-failure
+      - name: Package with game assets
+        run: |
+          python tools/make_release.py --platform ${{ matrix.platform }} --binary "${{ matrix.binary }}" \
+            --version "${{ steps.version.outputs.version }}" --assets "${{ steps.assets.outputs.dir }}" --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.platform }}
+          path: dist/*
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    needs: package
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: package-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum OpenSmash-* > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Release notes
+        run: python tools/release_notes.py "${GITHUB_REF_NAME#v}" > notes.md && cat notes.md
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          flags=()
+          [[ "$GITHUB_REF_NAME" == *-* ]] && flags+=(--prerelease)
+          gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --title "OpenSmash ${GITHUB_REF_NAME#v}" \
+            --notes-file notes.md "${flags[@]}"
